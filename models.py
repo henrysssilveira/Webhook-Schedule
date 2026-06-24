@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 
 class Schedule(BaseModel):
+    id: int | None = None
     name: str
     execute_at: TimeConfig
     webhook_url: str
