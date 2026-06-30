@@ -1,4 +1,4 @@
-from fastapi import FastAPI, status, HTTPException
+from fastapi import FastAPI, status, HTTPException, Depends
 from pydantic import BaseModel, Field
 from models import Schedule
 from database import get_connection
@@ -7,6 +7,31 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from worker import run_worker, notify_new_schedule
 import asyncio
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import secrets
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+API_KEY = os.getenv("API_KEY")
+print(API_KEY)
+
+security = HTTPBearer(auto_error=True)
+
+
+def verify_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    token = credentials.credentials
+
+    if not secrets.compare_digest(token, API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido",
+        )
+
+    return token
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -18,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/ScheduleCreate/", status_code=status.HTTP_201_CREATED)
-async def create_schedule(schedule: Schedule):
+async def create_schedule(schedule: Schedule, user=Depends(verify_token)):
     schedule_dict = schedule.model_dump()
     schedule_exec = schedule.execute_at
 
@@ -87,7 +112,7 @@ async def create_schedule(schedule: Schedule):
     }
 
 @app.get("/ScheduleList/", response_model=list[Schedule])
-async def list_schedules():
+async def list_schedules(user=Depends(verify_token)):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -138,7 +163,7 @@ async def list_schedules():
             return schedules
 
 @app.get("/ScheduleGet/{schedule_id}", response_model=Schedule)
-async def get_schedule(schedule_id: int):
+async def get_schedule(schedule_id: int, user=Depends(verify_token)):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -178,7 +203,7 @@ async def get_schedule(schedule_id: int):
                 raise HTTPException(status_code=404, detail="Schedule not found")
 
 @app.delete("/ScheduleDelete/{schedule_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_schedule(schedule_id: int):
+async def delete_schedule(schedule_id: int, user=Depends(verify_token)):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
