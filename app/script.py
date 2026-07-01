@@ -71,7 +71,7 @@ async def create_schedule(schedule: Schedule, user=Depends(verify_token)):
             year=ano, month=mes, day=dia,
             hour=schedule.execute_at.hour,
             minute=schedule.execute_at.minutes,
-            second=segundos
+            second=segundos,
             tzinfo=LOCAL_TZ
         )
     else:
