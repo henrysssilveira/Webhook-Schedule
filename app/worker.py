@@ -13,8 +13,47 @@ import asyncio
 import json
 import heapq
 import httpx
-from datetime import datetime, timedelta
+import os
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
 from database import get_connection
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Timezone — lido do .env
+# Aceita nome IANA:   TIMEZONE=America/Sao_Paulo
+# Aceita offset horas: TIMEZONE=-3  ou  TIMEZONE=+5.5
+# ---------------------------------------------------------------------------
+
+def _load_timezone() -> timezone | ZoneInfo:
+    tz_env = os.getenv("TIMEZONE", "UTC").strip()
+    try:
+        offset_hours = float(tz_env)
+        return timezone(timedelta(hours=offset_hours))
+    except ValueError:
+        return ZoneInfo(tz_env)
+
+LOCAL_TZ = _load_timezone()
+
+
+def _now() -> datetime:
+    """Retorna o datetime atual sempre com timezone."""
+    return datetime.now(tz=LOCAL_TZ)
+
+
+def _aware(dt: datetime) -> datetime:
+    """
+    Garante que um datetime do banco venha com timezone.
+    Se já vier com tz → converte para LOCAL_TZ.
+    Se vier naive (sem tz) → assume que está em LOCAL_TZ.
+    """
+    if dt is None:
+        return dt
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=LOCAL_TZ)
+    return dt.astimezone(LOCAL_TZ)
 
 
 # ---------------------------------------------------------------------------
@@ -32,25 +71,16 @@ def notify_new_schedule():
 
 
 # ---------------------------------------------------------------------------
-# Estrutura interna da fila — guardamos tuplas para o heapq
-# heapq é um min-heap: o menor execute_at fica sempre no topo (índice 0)
+# Estrutura interna da fila
 # ---------------------------------------------------------------------------
-# Formato do item na heap: (execute_at: datetime, id: int, row: dict)
-
 _queue: list[tuple[datetime, int, dict]] = []
 
 
 def _load_from_db() -> None:
-    """
-    Lê todos os schedules do banco e reconstrói a fila.
-    Schedules com execute_at no passado:
-      - daily=True  → reagenda para o próximo ciclo (hoje + 1 dia ou mais)
-      - daily=False → ignora (já expirou)
-    """
     global _queue
     _queue = []
 
-    now = datetime.now()
+    now = _now()
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -63,7 +93,8 @@ def _load_from_db() -> None:
     for row in rows:
         db_id, name, execute_at, webhook_url, payload, daily = row
 
-        # Normaliza payload para dict
+        execute_at = _aware(execute_at)  # ← garante timezone consistente
+
         if isinstance(payload, str):
             try:
                 payload = json.loads(payload)
@@ -79,7 +110,6 @@ def _load_from_db() -> None:
             "daily":       daily,
         }
 
-        # Trata schedules no passado
         if execute_at <= now:
             if daily:
                 item["execute_at"] = _next_daily(execute_at, now)
@@ -94,10 +124,6 @@ def _load_from_db() -> None:
 
 
 def _next_daily(execute_at: datetime, now: datetime) -> datetime:
-    """
-    Calcula o próximo horário para um schedule diário.
-    Avança de 1 em 1 dia até ficar no futuro.
-    """
     next_dt = execute_at
     while next_dt <= now:
         next_dt += timedelta(days=1)
@@ -105,13 +131,12 @@ def _next_daily(execute_at: datetime, now: datetime) -> datetime:
 
 
 def _print_queue_state() -> None:
-    """Imprime o estado atual da fila de forma legível."""
     if not _queue:
         print("[WORKER] 📭 Fila vazia.")
         return
     print("[WORKER] 📋 Estado da fila:")
     for i, (dt, db_id, item) in enumerate(sorted(_queue)):
-        delta = dt - datetime.now()
+        delta = dt - _now()
         total_secs = int(delta.total_seconds())
         print(f"  [{i+1}] id={db_id} | '{item['name']}' | em {dt} (~{total_secs}s)")
 
@@ -121,12 +146,8 @@ def _print_queue_state() -> None:
 # ---------------------------------------------------------------------------
 
 async def _fire_webhook(item: dict) -> None:
-    """
-    Faz o POST para o webhook_url com o payload do schedule.
-    Loga o resultado (status code) ou o erro caso a requisição falhe.
-    """
     print("\n" + "=" * 60)
-    print(f"[WORKER] 🚀 DISPARANDO WEBHOOK — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[WORKER] 🚀 DISPARANDO WEBHOOK — {_now().strftime('%Y-%m-%d %H:%M:%S %Z')}")
     print(f"  Schedule : '{item['name']}' (id={item['id']})")
     print(f"  URL      : {item['webhook_url']}")
     print(f"  Payload  : {json.dumps(item['payload'], indent=4, ensure_ascii=False)}")
@@ -154,15 +175,7 @@ async def _fire_webhook(item: dict) -> None:
 # ---------------------------------------------------------------------------
 
 async def run_worker() -> None:
-    """
-    Loop principal assíncrono.
-
-    Lógica de sleep dinâmico:
-      - Se a fila estiver vazia → dorme indefinidamente até ser acordado pela API
-      - Se houver itens → dorme até o execute_at do primeiro item (ou até ser acordado)
-      - Se for acordado antes do tempo (novo POST chegou) → recalcula sem disparar
-    """
-    print("[WORKER] ✅ Worker iniciado.")
+    print(f"[WORKER] ✅ Worker iniciado. Timezone: {LOCAL_TZ}")
     _load_from_db()
 
     while True:
@@ -175,18 +188,16 @@ async def run_worker() -> None:
             _load_from_db()
             continue
 
-        # Peek no topo da fila sem remover
         next_dt, next_id, next_item = _queue[0]
-        now = datetime.now()
+        now = _now()
         sleep_secs = (next_dt - now).total_seconds()
 
         if sleep_secs <= 0:
-            # Já passou do tempo — dispara imediatamente
             heapq.heappop(_queue)
             await _fire_webhook(next_item)
 
             if next_item["daily"]:
-                new_dt = _next_daily(next_dt, datetime.now())
+                new_dt = _next_daily(next_dt, _now())
                 next_item["execute_at"] = new_dt
                 heapq.heappush(_queue, (new_dt, next_id, next_item))
                 print(f"[WORKER] 🔁 '{next_item['name']}' reagendado para {new_dt}")
@@ -198,18 +209,15 @@ async def run_worker() -> None:
 
         try:
             await asyncio.wait_for(_wakeup_event.wait(), timeout=sleep_secs)
-
-            # Acordado antes do timeout = novo schedule adicionado
             print("[WORKER] 🔔 Novo schedule detectado! Reconstruindo fila...")
             _load_from_db()
 
         except asyncio.TimeoutError:
-            # Timeout expirou = hora de disparar
             heapq.heappop(_queue)
             await _fire_webhook(next_item)
 
             if next_item["daily"]:
-                new_dt = _next_daily(next_dt, datetime.now())
+                new_dt = _next_daily(next_dt, _now())
                 next_item["execute_at"] = new_dt
                 heapq.heappush(_queue, (new_dt, next_id, next_item))
                 print(f"[WORKER] 🔁 '{next_item['name']}' reagendado para {new_dt}")
@@ -218,7 +226,7 @@ async def run_worker() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Entry point — útil para testar o worker isolado: `python worker.py`
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
