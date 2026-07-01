@@ -6,3 +6,12 @@ services:
       - .env
     expose:
       - "8000"
+    networks:
+      - default
+      - easypanel-flow-applications
+
+networks:
+  default: {}
+  easypanel-flow-applications:
+    external: true
+    name: easypanel-flow-applications
