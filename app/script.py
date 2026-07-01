@@ -10,6 +10,8 @@ import asyncio
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import secrets
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
+from datetime import timezone, timedelta
 import os
 
 load_dotenv()
@@ -19,6 +21,15 @@ print(API_KEY)
 
 security = HTTPBearer(auto_error=True)
 
+def _get_tz():
+    tz_env = os.getenv("TIMEZONE", "UTC").strip()
+    try:
+        offset_hours = float(tz_env)
+        return timezone(timedelta(hours=offset_hours))
+    except ValueError:
+        return ZoneInfo(tz_env)
+
+LOCAL_TZ = _get_tz()
 
 def verify_token(
     credentials: HTTPAuthorizationCredentials = Depends(security)
@@ -61,6 +72,7 @@ async def create_schedule(schedule: Schedule, user=Depends(verify_token)):
             hour=schedule.execute_at.hour,
             minute=schedule.execute_at.minutes,
             second=segundos
+            tzinfo=LOCAL_TZ
         )
     else:
         # daily=True sem data → usa hoje como ponto de partida
