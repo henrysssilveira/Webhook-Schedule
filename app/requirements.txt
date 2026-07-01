@@ -1,5 +1,5 @@
 pydantic
 fastapi
 uvicorn
-psycopg
+psycopg[binary]
 httpx
